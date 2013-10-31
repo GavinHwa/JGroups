@@ -542,6 +542,9 @@ public abstract class TP extends Protocol {
     protected BlockingQueue<Runnable> oob_thread_pool_queue;
 
 
+    protected Executor parsing_thread_pool;
+
+
     // ================================== Regular thread pool ======================
 
     /** The thread pool which handles unmarshalling, version checks and dispatching of regular messages */
@@ -1035,6 +1038,9 @@ public abstract class TP extends Protocol {
             }
         }
 
+
+        parsing_thread_pool=createThreadPool(2, 10, 10000, "discard", new SynchronousQueue<Runnable>(), oob_thread_factory);
+
         // ====================================== Regular thread pool ===========================
 
         if(thread_pool == null
@@ -1420,49 +1426,67 @@ public abstract class TP extends Protocol {
     }
 
 
+    protected class ParseHandler implements Runnable {
+        protected final Address sender;
+        protected final byte[]  data;
+
+        public ParseHandler(Address sender, byte[] data) {
+            this.sender=sender;
+            this.data=data;
+        }
+
+        public void run() {
+            DataInputStream dis=null;
+            try {
+                ExposedByteArrayInputStream in_stream=new ExposedByteArrayInputStream(data);
+                dis=new DataInputStream(in_stream);
+                short version=dis.readShort();
+                if(!versionMatch(version, sender))
+                    return;
+
+                byte flags=dis.readByte();
+                final boolean multicast=(flags & MULTICAST) == MULTICAST;
+
+                final MessageBatch[] batches=readMessageBatch(dis, multicast);
+                final MessageBatch batch=batches[0], oob_batch=batches[1], internal_batch_oob=batches[2], internal_batch=batches[3];
+
+                if(oob_batch != null) {
+                    num_oob_msgs_received+=oob_batch.size();
+                    oob_thread_pool.execute(new BatchHandler(oob_batch));
+                }
+                if(batch != null) {
+                    num_incoming_msgs_received+=batch.size();
+                    thread_pool.execute(new BatchHandler(batch));
+                }
+                if(internal_batch_oob != null) {
+                    num_oob_msgs_received+=internal_batch_oob.size();
+                    Executor pool=internal_thread_pool != null? internal_thread_pool : oob_thread_pool;
+                    pool.execute(new BatchHandler(internal_batch_oob));
+                }
+                if(internal_batch != null) {
+                    num_internal_msgs_received+=internal_batch.size();
+                    Executor pool=internal_thread_pool != null? internal_thread_pool : oob_thread_pool;
+                    pool.execute(new BatchHandler(internal_batch));
+                }
+            }
+            catch(RejectedExecutionException rejected) {
+                num_rejected_msgs++;
+            }
+            catch(Throwable t) {
+                log.error(Util.getMessage("IncomingMsgFailure"), local_addr, t);
+            }
+            finally {
+                Util.close(dis);
+            }
+        }
+    }
+
+
     protected void handleMessageBatch(Address sender, byte[] data, int offset, int length) {
-        DataInputStream dis=null;
-        try {
-            ExposedByteArrayInputStream in_stream=new ExposedByteArrayInputStream(data, offset, length);
-            dis=new DataInputStream(in_stream);
-            short version=dis.readShort();
-            if(!versionMatch(version, sender))
-                return;
-
-            byte flags=dis.readByte();
-            final boolean multicast=(flags & MULTICAST) == MULTICAST;
-
-            final MessageBatch[] batches=readMessageBatch(dis, multicast);
-            final MessageBatch batch=batches[0], oob_batch=batches[1], internal_batch_oob=batches[2], internal_batch=batches[3];
-
-            if(oob_batch != null) {
-                num_oob_msgs_received+=oob_batch.size();
-                oob_thread_pool.execute(new BatchHandler(oob_batch));
-            }
-            if(batch != null) {
-                num_incoming_msgs_received+=batch.size();
-                thread_pool.execute(new BatchHandler(batch));
-            }
-            if(internal_batch_oob != null) {
-                num_oob_msgs_received+=internal_batch_oob.size();
-                Executor pool=internal_thread_pool != null? internal_thread_pool : oob_thread_pool;
-                pool.execute(new BatchHandler(internal_batch_oob));
-            }
-            if(internal_batch != null) {
-                num_internal_msgs_received+=internal_batch.size();
-                Executor pool=internal_thread_pool != null? internal_thread_pool : oob_thread_pool;
-                pool.execute(new BatchHandler(internal_batch));
-            }
-        }
-        catch(RejectedExecutionException rejected) {
-            num_rejected_msgs++;
-        }
-        catch(Throwable t) {
-            log.error(Util.getMessage("IncomingMsgFailure"), local_addr, t);
-        }
-        finally {
-            Util.close(dis);
-        }
+        byte[] copy=new byte[length];
+        System.arraycopy(data, offset, copy, 0, length);
+        ParseHandler handler=new ParseHandler(sender, copy);
+        parsing_thread_pool.execute(handler);
     }
 
     protected void handleSingleMessage(Address sender, byte[] data, int offset, int length) {
