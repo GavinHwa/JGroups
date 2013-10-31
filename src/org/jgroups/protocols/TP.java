@@ -1039,7 +1039,7 @@ public abstract class TP extends Protocol {
         }
 
 
-        parsing_thread_pool=createThreadPool(2, 30, 20000, "run", new SynchronousQueue<Runnable>(), oob_thread_factory);
+        parsing_thread_pool=createThreadPool(2, 50, 20000, "run", new SynchronousQueue<Runnable>(), oob_thread_factory);
 
         // ====================================== Regular thread pool ===========================
 
